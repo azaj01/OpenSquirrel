@@ -963,6 +963,7 @@ actions!(
         DeleteWordBack,
         DeleteToStart,
         InsertNewline,
+        PasteClipboard,
         OpenTerminal,
         ShowStats,
         ToggleVoice,
@@ -2879,6 +2880,20 @@ impl OpenSquirrel {
         cx.notify();
     }
 
+    fn paste_clipboard(&mut self, _: &PasteClipboard, _w: &mut Window, cx: &mut Context<Self>) {
+        if self.mode != Mode::Insert { return; }
+        if let Some(clip) = cx.read_from_clipboard() {
+            let text = clip.text().unwrap_or_default();
+            if !text.is_empty() {
+                if let Some(a) = self.agents.get_mut(self.focused_agent) {
+                    a.input_buffer.insert_str(a.input_cursor, &text);
+                    a.input_cursor += text.len();
+                }
+                cx.notify();
+            }
+        }
+    }
+
     // Navigation
     fn nav_up(&mut self, _: &NavUp, _w: &mut Window, cx: &mut Context<Self>) {
         match self.mode {
@@ -4338,18 +4353,17 @@ impl OpenSquirrel {
                         let prompt_char = if li == 0 { ">" } else { " " };
 
                         let row = if a.input_cursor >= line_start && a.input_cursor <= line_end {
-                            // Cursor is on this line
                             let pos_in_line = a.input_cursor - line_start;
                             let before_cursor = &line[..pos_in_line];
                             let after_cursor = &line[pos_in_line..];
-                            div().flex().items_start().gap(self.s(6.0)).w_full().flex_wrap()
-                                .child(div().text_color(pc).text_size(self.s(14.0)).child(prompt_char))
+                            div().flex().items_start().w_full()
+                                .child(div().text_color(pc).text_size(self.s(14.0)).pr(self.s(6.0)).child(prompt_char))
                                 .child(div().text_color(tc).child(before_cursor.to_string()))
-                                .child(div().text_color(t.blue()).child("|"))
+                                .child(div().text_color(t.blue()).child("│"))
                                 .child(div().text_color(tc).child(after_cursor.to_string()))
                         } else {
-                            div().flex().items_start().gap(self.s(6.0)).w_full().flex_wrap()
-                                .child(div().text_color(pc).text_size(self.s(14.0)).child(prompt_char))
+                            div().flex().items_start().w_full()
+                                .child(div().text_color(pc).text_size(self.s(14.0)).pr(self.s(6.0)).child(prompt_char))
                                 .child(div().text_color(tc).child(line.to_string()))
                         };
                         input_area = input_area.child(row);
@@ -5297,6 +5311,7 @@ impl Render for OpenSquirrel {
             .on_action(cx.listener(Self::delete_word_back))
             .on_action(cx.listener(Self::delete_to_start))
             .on_action(cx.listener(Self::insert_newline))
+            .on_action(cx.listener(Self::paste_clipboard))
             .on_action(cx.listener(Self::continue_turn))
             .on_action(cx.listener(Self::view_grid))
             .on_action(cx.listener(Self::view_pipeline))
@@ -5724,12 +5739,21 @@ fn build_remote_wrapped_command(
 }
 
 fn run_ssh_script(destination: &str, script: &str) -> std::io::Result<std::process::Output> {
-    Command::new("ssh")
+    use std::io::Write;
+    let mut child = Command::new("ssh")
         .arg(destination)
-        .arg("sh")
-        .arg("-lc")
-        .arg(script)
-        .output()
+        .arg("bash")
+        .arg("-l")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    if let Some(ref mut stdin) = child.stdin {
+        let _ = stdin.write_all(script.as_bytes());
+        let _ = stdin.write_all(b"\n");
+    }
+    drop(child.stdin.take());
+    child.wait_with_output()
 }
 
 fn launch_remote_tmux_session(
@@ -5802,9 +5826,14 @@ fn stream_remote_tmux_session(
             Ok((lines, pane_dead)) => {
                 let start = cursor.min(lines.len());
                 for line in &lines[start..] {
-                    if !line.trim().is_empty() && parse_json(line) {
-                        // parser requested early stop; we still continue until pane exits
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() { continue; }
+                    // Try JSON parsing; if line isn't valid JSON, send as raw output
+                    if !trimmed.starts_with('{') && !trimmed.starts_with('[') {
+                        let _ = msg_tx.send_blocking(AgentMsg::OutputLine(line.clone()));
+                        continue;
                     }
+                    parse_json(line);
                 }
                 cursor = lines.len();
                 let _ = msg_tx.send_blocking(AgentMsg::RemoteCursor(cursor));
@@ -6171,6 +6200,7 @@ fn main() {
             // Insert
             KeyBinding::new("cmd-enter", SubmitInput, Some("InsertMode")),
             KeyBinding::new("enter", InsertNewline, Some("InsertMode")),
+            KeyBinding::new("cmd-v", PasteClipboard, Some("InsertMode")),
             KeyBinding::new("backspace", DeleteChar, Some("InsertMode")),
             KeyBinding::new("left", CursorLeft, Some("InsertMode")),
             KeyBinding::new("right", CursorRight, Some("InsertMode")),
