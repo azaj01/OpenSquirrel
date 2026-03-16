@@ -5767,11 +5767,13 @@ fn launch_remote_tmux_session(
     let remote_command = build_remote_wrapped_command(runtime, args, prompt, workdir);
     // Wrap in a login shell so PATH includes user-installed tools (claude, codex, etc.)
     let login_wrapped = format!("bash -lc {}", shell_escape(&remote_command));
+    let escaped_session = shell_escape(session_name);
     let script = format!(
         "tmux kill-session -t {session} >/dev/null 2>&1 || true; \
-         tmux new-session -d -s {session} {command}; \
+         tmux new-session -d -s {session} -x 300 -y 50 {command}; \
+         tmux set-option -t {session} history-limit 50000 >/dev/null 2>&1 || true; \
          tmux set-option -t {session} remain-on-exit on >/dev/null 2>&1",
-        session = shell_escape(session_name),
+        session = escaped_session,
         command = shell_escape(&login_wrapped),
     );
     let output = run_ssh_script(destination, &script)?;
@@ -5785,7 +5787,7 @@ fn launch_remote_tmux_session(
 fn remote_tmux_snapshot(destination: &str, session_name: &str) -> anyhow::Result<(Vec<String>, bool)> {
     let script = format!(
         "if ! tmux has-session -t {session} 2>/dev/null; then echo '__OSQ_NO_SESSION__'; exit 0; fi; \
-         tmux capture-pane -p -J -t {session}; \
+         tmux capture-pane -p -J -S - -t {session}; \
          printf '\\n__OSQ_PANE_DEAD__=%s\\n' \"$(tmux display-message -p -t {session} '#{{pane_dead}}' 2>/dev/null || echo 1)\"",
         session = shell_escape(session_name),
     );
@@ -5828,7 +5830,7 @@ fn stream_remote_tmux_session(
                 for line in &lines[start..] {
                     let trimmed = line.trim();
                     if trimmed.is_empty() { continue; }
-                    // Try JSON parsing; if line isn't valid JSON, send as raw output
+                    if trimmed.starts_with("Pane is dead") { continue; }
                     if !trimmed.starts_with('{') && !trimmed.starts_with('[') {
                         let _ = msg_tx.send_blocking(AgentMsg::OutputLine(line.clone()));
                         continue;
