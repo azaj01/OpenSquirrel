@@ -15,10 +15,9 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 // Voice input is disabled for v1 ship. Set to true to re-enable.
 const VOICE_ENABLED: bool = false;
 
-fn list_home_dirs() -> Vec<String> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+fn list_subdirs(parent: &str) -> Vec<String> {
     let mut dirs = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&home) {
+    if let Ok(entries) = std::fs::read_dir(parent) {
         for entry in entries.flatten() {
             if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
                 let name = entry.file_name().to_string_lossy().to_string();
@@ -29,8 +28,12 @@ fn list_home_dirs() -> Vec<String> {
         }
     }
     dirs.sort();
-    dirs.insert(0, home);
     dirs
+}
+
+fn list_home_dirs() -> Vec<String> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    list_subdirs(&home)
 }
 
 // ── OpenRouter API ──────────────────────────────────────────────
@@ -2546,7 +2549,24 @@ impl OpenSquirrel {
                 cx.notify();
             }
             Mode::Setup => {
-                // Enter advances setup steps (same as Tab), finishes on Confirm
+                let is_dir_step = self.setup.as_ref().map(|s| s.step == SetupStep::Directory).unwrap_or(false);
+                if is_dir_step {
+                    // Enter drills into the selected directory
+                    if let Some(ref mut s) = self.setup {
+                        let filtered = Self::filter_dirs(&s.dir_entries, &s.dir_filter);
+                        if let Some(dir) = filtered.get(s.dir_cursor).cloned() {
+                            let path = std::path::Path::new(&dir);
+                            if path.is_dir() {
+                                s.selected_dir = dir.clone();
+                                s.dir_entries = list_subdirs(&dir);
+                                s.dir_filter.clear();
+                                s.dir_cursor = 0;
+                            }
+                        }
+                    }
+                    cx.notify();
+                    return;
+                }
                 self.setup_next(&SetupNext, _w, cx);
                 return;
             }
@@ -2707,11 +2727,8 @@ impl OpenSquirrel {
                 }
             }
             SetupStep::Directory => {
+                // Tab confirms current selected_dir and advances
                 if let Some(ref mut s) = self.setup {
-                    let filtered = Self::filter_dirs(&s.dir_entries, &s.dir_filter);
-                    if let Some(dir) = filtered.get(s.dir_cursor) {
-                        s.selected_dir = dir.clone();
-                    }
                     s.step = SetupStep::Runtime;
                 }
             }
@@ -4763,14 +4780,28 @@ impl OpenSquirrel {
             }
             SetupStep::Directory => {
                 let filtered = Self::filter_dirs(&setup.dir_entries, &setup.dir_filter);
+                let home = std::env::var("HOME").unwrap_or_default();
+                let current_display = if !home.is_empty() && setup.selected_dir.starts_with(&home) {
+                    format!("~{}", &setup.selected_dir[home.len()..])
+                } else { setup.selected_dir.clone() };
+
+                // Current directory + hint
+                w = w.child(
+                    div().w_full().px(self.s(14.0)).py(self.s(6.0))
+                        .flex().items_center().gap(self.s(8.0))
+                        .child(div().text_size(self.s(11.0)).text_color(t.text_muted()).child("cwd:"))
+                        .child(div().text_size(self.s(12.0)).text_color(t.text()).child(current_display))
+                        .child(div().flex_grow())
+                        .child(div().text_size(self.s(9.0)).text_color(t.text_faint()).child("Enter=open  Tab=use this dir"))
+                );
                 // Filter bar
                 w = w.child(
-                    div().w_full().px(self.s(14.0)).py(self.s(8.0)).border_b_1().border_color(t.palette_border())
+                    div().w_full().px(self.s(14.0)).py(self.s(6.0)).border_b_1().border_color(t.palette_border())
                         .flex().items_center().gap(self.s(8.0))
-                        .child(div().text_size(self.s(12.0)).text_color(t.blue()).child("dir:"))
+                        .child(div().text_size(self.s(12.0)).text_color(t.blue()).child("filter:"))
                         .child(div().text_size(self.s(13.0)).text_color(t.text()).child(
                             if setup.dir_filter.is_empty() {
-                                "type to filter directories...".to_string()
+                                "type to search...".to_string()
                             } else {
                                 format!("{}│", setup.dir_filter)
                             }
