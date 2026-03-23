@@ -838,11 +838,7 @@ pub(crate) fn agent_thread(
         let mut turn_args = runtime.args.clone();
         if let Some(ref model) = model_override {
             if !model.is_empty() && !runtime.model_flag.is_empty() {
-                if runtime.model_flag == "-c" {
-                    turn_args.extend(["-c".into(), format!("model=\"{model}\"")]);
-                } else {
-                    turn_args.extend([runtime.model_flag.clone(), model.clone()]);
-                }
+                turn_args.extend([runtime.model_flag.clone(), model.clone()]);
             }
         }
         if let Some(ref session_id) = session_id {

@@ -322,6 +322,7 @@ enum Mode {
     Search,
     AgentMenu,
     Settings,
+    ModelPicker,
 }
 
 // ── Actions ─────────────────────────────────────────────────────
@@ -388,6 +389,7 @@ actions!(
         ChangesDown,
         ChangesStage,
         ChangesRefresh,
+        OpenModelPicker,
         Quit,
     ]
 );
@@ -703,6 +705,66 @@ struct DelegateTask {
     prompt: String,
 }
 
+// ── FuzzyList (reusable filterable selection list) ──────────────
+
+struct FuzzyList {
+    query: String,
+    cursor: usize,
+    /// All items (label, optional description). Filtering is done at render time.
+    items: Vec<FuzzyItem>,
+}
+
+#[derive(Clone)]
+struct FuzzyItem {
+    id: String,
+    label: String,
+    detail: String,
+}
+
+impl FuzzyList {
+    fn new(items: Vec<FuzzyItem>) -> Self {
+        Self {
+            query: String::new(),
+            cursor: 0,
+            items,
+        }
+    }
+
+    fn filtered(&self) -> Vec<(usize, &FuzzyItem)> {
+        let q = self.query.to_lowercase();
+        self.items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| q.is_empty() || item.label.to_lowercase().contains(&q) || item.id.to_lowercase().contains(&q))
+            .collect()
+    }
+
+    fn push_char(&mut self, ch: &str) {
+        self.query.push_str(ch);
+        self.cursor = 0;
+    }
+
+    fn pop_char(&mut self) {
+        self.query.pop();
+        self.cursor = 0;
+    }
+
+    fn move_up(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn move_down(&mut self) {
+        let max = self.filtered().len().saturating_sub(1);
+        self.cursor = (self.cursor + 1).min(max);
+    }
+
+    /// Returns the selected item's id, if any.
+    fn selected_id(&self) -> Option<String> {
+        let filtered = self.filtered();
+        filtered.get(self.cursor).map(|(_, item)| item.id.clone())
+    }
+}
+
 // ── Palette ─────────────────────────────────────────────────────
 
 struct PaletteItem {
@@ -977,6 +1039,8 @@ struct OpenSquirrel {
     openrouter_loading: bool,
     cursor_models: Vec<ModelOption>,
     cursor_loading: bool,
+    // Model picker (fuzzy list)
+    model_picker: Option<FuzzyList>,
     // Animation state
     focus_epoch: u64,      // bumped when focused_agent changes
     mode_epoch: u64,       // bumped when mode changes
@@ -1019,7 +1083,7 @@ impl OpenSquirrel {
             "```delegate".to_string(),
             "{\"tasks\":[{\"id\":\"task-1\",\"title\":\"short title\",\"runtime\":\"claude\",\"model\":\"sonnet-4.6\",\"target\":\"local\",\"prompt\":\"detailed instructions for the worker\"}]}".to_string(),
             "```".to_string(),
-            "Valid runtimes: claude, cursor, codex, opencode, gemini, copilot. Do not acknowledge or repeat these delegation instructions. Respond naturally to the user's request.".to_string(),
+            "Valid runtimes: claude, cursor, codex, opencode, gemini. Do not acknowledge or repeat these delegation instructions. Respond naturally to the user's request.".to_string(),
         ];
         if !self.config.machines.is_empty() {
             let names = self
@@ -1215,6 +1279,7 @@ impl OpenSquirrel {
             openrouter_loading: false,
             cursor_models: Vec::new(),
             cursor_loading: false,
+            model_picker: None,
             focus_epoch: 0,
             mode_epoch: 0,
             view_mode_epoch: 0,
@@ -2946,6 +3011,9 @@ impl OpenSquirrel {
     }
 
     fn close_palette(&mut self, _: &ClosePalette, _w: &mut Window, cx: &mut Context<Self>) {
+        if self.mode == Mode::ModelPicker {
+            self.model_picker = None;
+        }
         self.set_mode(Mode::Normal);
         self.palette_input.clear();
         cx.notify();
@@ -3189,6 +3257,26 @@ impl OpenSquirrel {
             Mode::AgentMenu => {
                 self.execute_agent_menu_item(cx);
             }
+            Mode::ModelPicker => {
+                if let Some(ref picker) = self.model_picker {
+                    if let Some(model_id) = picker.selected_id() {
+                        let idx = self.focused_agent;
+                        if idx < self.agents.len() {
+                            self.agents[idx].tokens.model = model_id.clone();
+                            self.agents[idx].last_model = Some(model_id.clone());
+                            // Persist to runtime config
+                            let rt_name = self.agents[idx].runtime_name.clone();
+                            if let Some(rt) = self.config.runtimes.iter_mut().find(|r| r.name == rt_name) {
+                                rt.last_model = model_id;
+                            }
+                            self.save_config();
+                        }
+                    }
+                }
+                self.model_picker = None;
+                self.set_mode(Mode::Normal);
+                cx.notify();
+            }
             _ => {}
         }
     }
@@ -3254,6 +3342,18 @@ impl OpenSquirrel {
                     return;
                 }
             }
+            Mode::ModelPicker => {
+                if let Some(ref mut picker) = self.model_picker {
+                    if picker.query.is_empty() {
+                        // Empty query + backspace = close picker
+                        self.model_picker = None;
+                        self.set_mode(Mode::Normal);
+                        cx.notify();
+                        return;
+                    }
+                    picker.pop_char();
+                }
+            }
             _ => {}
         }
         cx.notify();
@@ -3313,6 +3413,7 @@ impl OpenSquirrel {
         if self.mode == Mode::Normal
             || self.mode == Mode::Palette
             || self.mode == Mode::Search
+            || self.mode == Mode::ModelPicker
             || is_setup_typing
         {
             if event.keystroke.modifiers.platform
@@ -3344,6 +3445,12 @@ impl OpenSquirrel {
                     Mode::Search => {
                         self.search_query.push_str(ch);
                         self.rebuild_search();
+                        cx.notify();
+                    }
+                    Mode::ModelPicker => {
+                        if let Some(ref mut picker) = self.model_picker {
+                            picker.push_char(ch);
+                        }
                         cx.notify();
                     }
                     Mode::Setup => {
@@ -3690,6 +3797,11 @@ impl OpenSquirrel {
             Mode::AgentMenu => {
                 self.agent_menu_selection = self.agent_menu_selection.saturating_sub(1);
             }
+            Mode::ModelPicker => {
+                if let Some(ref mut picker) = self.model_picker {
+                    picker.move_up();
+                }
+            }
         }
         cx.notify();
     }
@@ -3763,6 +3875,11 @@ impl OpenSquirrel {
             Mode::AgentMenu => {
                 let max = self.agent_menu_items.len().saturating_sub(1);
                 self.agent_menu_selection = (self.agent_menu_selection + 1).min(max);
+            }
+            Mode::ModelPicker => {
+                if let Some(ref mut picker) = self.model_picker {
+                    picker.move_down();
+                }
             }
         }
         cx.notify();
@@ -4066,6 +4183,35 @@ impl OpenSquirrel {
         cx.notify();
     }
 
+    fn open_model_picker(&mut self, _: &OpenModelPicker, _w: &mut Window, cx: &mut Context<Self>) {
+        if self.mode != Mode::Normal {
+            return;
+        }
+        self.clamp_focus();
+        let idx = self.focused_agent;
+        if idx >= self.agents.len() {
+            return;
+        }
+
+        let rt_name = &self.agents[idx].runtime_name;
+        let models: Vec<FuzzyItem> = self.get_models_for_runtime(rt_name)
+            .into_iter()
+            .map(|m| FuzzyItem {
+                id: m.id.clone(),
+                label: m.label.clone(),
+                detail: String::new(),
+            })
+            .collect();
+
+        if models.is_empty() {
+            return;
+        }
+
+        self.model_picker = Some(FuzzyList::new(models));
+        self.set_mode(Mode::ModelPicker);
+        cx.notify();
+    }
+
     fn restart_agent(&mut self, _: &RestartAgent, _w: &mut Window, cx: &mut Context<Self>) {
         if self.mode != Mode::Normal {
             return;
@@ -4279,16 +4425,31 @@ impl OpenSquirrel {
         .size_full()
     }
 
-    fn open_terminal(&mut self, _: &OpenTerminal, _w: &mut Window, _cx: &mut Context<Self>) {
+    fn open_terminal(&mut self, _: &OpenTerminal, _w: &mut Window, cx: &mut Context<Self>) {
         if self.mode != Mode::Normal {
             return;
         }
         self.clamp_focus();
         let idx = self.focused_agent;
         if idx < self.agents.len() {
-            let dir = &self.agents[idx].working_dir;
+            let dir = self.agents[idx].working_dir.clone();
             if !dir.is_empty() {
-                open_in_terminal(dir);
+                let group = self.agents[idx].group.clone();
+                let term_count = self.agents.iter().filter(|a| a.is_terminal).count();
+                let name = format!("term-{}", term_count);
+                self.create_agent_with_role(
+                    &name,
+                    &group,
+                    "terminal",
+                    None,
+                    "local",
+                    AgentRole::Coordinator,
+                    None,
+                    None,
+                    None,
+                    Some(&dir),
+                    cx,
+                );
             }
         }
     }
@@ -4434,6 +4595,61 @@ impl OpenSquirrel {
             b: c.b,
             a: c.a * o,
         }
+    }
+
+    /// Positioned popup modal with standard styling (bg, border, rounded, shadow).
+    /// Caller adds children, then wraps with `modal_fade()` for animation.
+    fn modal(&self, top: f32, left: f32, width: f32, max_height: Option<f32>) -> Div {
+        let t = &self.theme;
+        let mut d = div()
+            .absolute()
+            .top(self.s(top))
+            .left(self.s(left))
+            .w(self.s(width))
+            .bg(self.bg_alpha(t.palette_bg()))
+            .border_1()
+            .border_color(t.palette_border())
+            .rounded(self.s(12.0))
+            .shadow(vec![BoxShadow {
+                color: t.shadow().into(),
+                offset: point(px(0.), self.s(8.0)),
+                blur_radius: self.s(24.0),
+                spread_radius: self.s(4.0),
+            }])
+            .flex()
+            .flex_col()
+            .overflow_hidden();
+        if let Some(mh) = max_height {
+            d = d.max_h(self.s(mh));
+        }
+        d
+    }
+
+    /// Standard fade-in animation for modals. Call as the last step after adding children.
+    fn modal_fade<E: Styled + IntoElement + 'static>(&self, el: E, id_prefix: &str) -> impl IntoElement {
+        let epoch = self.mode_epoch;
+        el.with_animation(
+            ElementId::Name(format!("{}-{}", id_prefix, epoch).into()),
+            Animation::new(Duration::from_millis(200)).with_easing(ease_out_quint()),
+            |el, delta| el.opacity(delta),
+        )
+    }
+
+    /// Selectable list row with standard padding, highlight, and cursor.
+    /// Caller adds children, flex layout, and on_click handler.
+    fn selectable_row(&self, id_prefix: &str, index: usize, selected: bool) -> Stateful<Div> {
+        let t = &self.theme;
+        div()
+            .id(ElementId::Name(format!("{}-{}", id_prefix, index).into()))
+            .w_full()
+            .px(self.s(14.0))
+            .py(self.s(7.0))
+            .cursor_pointer()
+            .bg(if selected {
+                t.selected_row()
+            } else {
+                rgba(0x00000000)
+            })
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<'_> {
@@ -4584,13 +4800,21 @@ impl OpenSquirrel {
                                 ""
                             };
                             let rt_c = t.runtime_color(&agent.runtime_name);
+                            let agent_bg = if af {
+                                surface_raised
+                            } else {
+                                rgba(0x00000000)
+                            };
                             sb =
                                 sb.child(
                                     div()
                                         .id(ElementId::Name(format!("sa-{}", i).into()))
                                         .w_full()
                                         .pl(self.s(20.0))
-                                        .py(self.s(2.0))
+                                        .pr(self.s(8.0))
+                                        .py(self.s(3.0))
+                                        .rounded(self.s(6.0))
+                                        .bg(agent_bg)
                                         .flex()
                                         .items_center()
                                         .gap(self.s(6.0))
@@ -4837,6 +5061,7 @@ impl OpenSquirrel {
             Mode::Search => ("SEARCH", t.yellow()),
             Mode::AgentMenu => ("MENU", t.green()),
             Mode::Settings => ("SETTINGS", t.blue()),
+            Mode::ModelPicker => ("MODEL", t.yellow()),
         };
         let vl = match self.view_mode {
             ViewMode::Grid => "grid",
@@ -5110,6 +5335,7 @@ impl OpenSquirrel {
             .min_w(px(0.))
             .h_full()
             .bg(self.bg_alpha(t.bg()))
+            .rounded(self.s(10.0))
             .flex()
             .flex_col()
             .overflow_hidden()
@@ -5165,7 +5391,7 @@ impl OpenSquirrel {
             .min_w(px(0.))
             .px(self.s(10.0))
             .pt(px(36.0))
-            .pb(self.s(4.0))
+            .pb(self.s(6.0))
             .bg(self.bg_alpha(t.surface()))
             .border_b_1()
             .border_color(t.border())
@@ -5308,18 +5534,29 @@ impl OpenSquirrel {
                     .text_color(btn_color)
                     .hover(|s| s.bg(sr).text_color(btn_hover))
                     .child("↗")
-                    .on_click(cx.listener(move |this, _, _, _cx| {
+                    .on_click(cx.listener(move |this, _, _, cx| {
                         let dir = if idx < this.agents.len() {
                             this.agents[idx].working_dir.clone()
                         } else {
                             String::new()
                         };
                         if !dir.is_empty() {
-                            let _ = Command::new("open")
-                                .arg("-a")
-                                .arg("Terminal")
-                                .arg(&dir)
-                                .spawn();
+                            let group = this.agents[idx].group.clone();
+                            let term_count = this.agents.iter().filter(|a| a.is_terminal).count();
+                            let name = format!("term-{}", term_count);
+                            this.create_agent_with_role(
+                                &name,
+                                &group,
+                                "terminal",
+                                None,
+                                "local",
+                                AgentRole::Coordinator,
+                                None,
+                                None,
+                                None,
+                                Some(&dir),
+                                cx,
+                            );
                         }
                     })),
             );
@@ -5403,52 +5640,6 @@ impl OpenSquirrel {
                 .gap(self.s(4.0))
                 .overflow_hidden();
 
-            if a.tokens.thinking_enabled {
-                badges = badges.child(
-                    div()
-                        .px(self.s(4.0))
-                        .py(self.s(1.0))
-                        .rounded(self.s(3.0))
-                        .bg(sr)
-                        .text_size(self.s(8.0))
-                        .text_color(t.yellow())
-                        .child("think"),
-                );
-            }
-            if !a.runtime_info.plugins.is_empty() {
-                let n = a.runtime_info.plugins.len();
-                badges = badges.child(
-                    div()
-                        .px(self.s(4.0))
-                        .py(self.s(1.0))
-                        .rounded(self.s(3.0))
-                        .bg(sr)
-                        .text_size(self.s(8.0))
-                        .text_color(t.blue_muted())
-                        .child(if n == 1 {
-                            "1 plugin".into()
-                        } else {
-                            format!("{} plugins", n)
-                        }),
-                );
-            }
-            if !a.runtime_info.mcps.is_empty() {
-                let n = a.runtime_info.mcps.len();
-                badges = badges.child(
-                    div()
-                        .px(self.s(4.0))
-                        .py(self.s(1.0))
-                        .rounded(self.s(3.0))
-                        .bg(sr)
-                        .text_size(self.s(8.0))
-                        .text_color(t.green())
-                        .child(if n == 1 {
-                            "1 mcp".into()
-                        } else {
-                            format!("{} mcps", n)
-                        }),
-                );
-            }
             if !tc_summary.is_empty() {
                 let tc_recent = a
                     .last_tool_call_at
@@ -6046,24 +6237,7 @@ impl OpenSquirrel {
 
     fn render_palette(&self, cx: &mut Context<Self>) -> impl IntoElement + use<'_> {
         let t = &self.theme;
-        let mut p = div()
-            .absolute()
-            .top(self.s(100.0))
-            .left(self.s(400.0))
-            .w(self.s(500.0))
-            .bg(t.palette_bg())
-            .border_1()
-            .border_color(t.palette_border())
-            .rounded(self.s(12.0))
-            .flex()
-            .flex_col()
-            .overflow_hidden()
-            .shadow(vec![BoxShadow {
-                color: t.shadow().into(),
-                offset: point(px(0.), self.s(8.0)),
-                blur_radius: self.s(24.0),
-                spread_radius: self.s(4.0),
-            }]);
+        let mut p = self.modal(100.0, 400.0, 500.0, None);
 
         p = p.child(
             div()
@@ -6092,17 +6266,7 @@ impl OpenSquirrel {
         for (i, item) in self.palette_items.iter().enumerate() {
             let sel = i == self.palette_selection;
             p = p.child(
-                div()
-                    .id(ElementId::Name(format!("pal-{}", i).into()))
-                    .w_full()
-                    .px(self.s(14.0))
-                    .py(self.s(8.0))
-                    .cursor_pointer()
-                    .bg(if sel {
-                        t.selected_row()
-                    } else {
-                        rgba(0x00000000)
-                    })
+                self.selectable_row("pal", i, sel)
                     .text_size(self.s(13.0))
                     .text_color(if sel { t.text() } else { t.text_muted() })
                     .child(item.label.clone())
@@ -6112,13 +6276,76 @@ impl OpenSquirrel {
                     })),
             );
         }
-        // Slide-in + fade animation
-        let epoch = self.mode_epoch;
-        p.with_animation(
-            ElementId::Name(format!("palette-slide-{}", epoch).into()),
-            Animation::new(Duration::from_millis(200)).with_easing(ease_out_quint()),
-            |el, delta| el.opacity(delta),
-        )
+        self.modal_fade(p, "palette")
+    }
+
+    fn render_model_picker(&self, cx: &mut Context<Self>) -> impl IntoElement + use<'_> {
+        let t = &self.theme;
+        let picker = self.model_picker.as_ref().unwrap();
+        let filtered = picker.filtered();
+        let agent_name = self
+            .agents
+            .get(self.focused_agent)
+            .map(|a| a.name.as_str())
+            .unwrap_or("agent");
+
+        let mut p = self.modal(60.0, 280.0, 500.0, Some(400.0));
+
+        p = p.child(
+            div()
+                .w_full()
+                .px(self.s(14.0))
+                .py(self.s(10.0))
+                .border_b_1()
+                .border_color(t.border())
+                .flex()
+                .items_center()
+                .gap(self.s(8.0))
+                .font_family(self.font_family.clone())
+                .text_size(self.s(14.0))
+                .child(div().text_color(t.blue()).child(">"))
+                .child(
+                    div()
+                        .text_color(t.text())
+                        .child(if picker.query.is_empty() {
+                            format!("select model for {}...", agent_name)
+                        } else {
+                            format!("{}|", picker.query)
+                        }),
+                ),
+        );
+
+        let mut list = div()
+            .w_full()
+            .flex_grow()
+            .overflow_hidden()
+            .flex()
+            .flex_col();
+
+        for (vi, (_, item)) in filtered.iter().enumerate() {
+            let sel = vi == picker.cursor;
+            list = list.child(
+                self.selectable_row("mpick", vi, sel)
+                    .flex()
+                    .items_center()
+                    .gap(self.s(8.0))
+                    .child(
+                        div()
+                            .text_size(self.s(13.0))
+                            .text_color(if sel { t.text() } else { t.text_muted() })
+                            .child(item.label.clone()),
+                    )
+                    .on_click(cx.listener(move |this, _event, window, cx| {
+                        if let Some(ref mut picker) = this.model_picker {
+                            picker.cursor = vi;
+                        }
+                        this.submit_input(&SubmitInput, window, cx);
+                    })),
+            );
+        }
+
+        p = p.child(list);
+        self.modal_fade(p, "mpicker")
     }
 
     fn render_agent_menu(&self, cx: &mut Context<Self>) -> impl IntoElement + use<'_> {
@@ -6136,24 +6363,7 @@ impl OpenSquirrel {
         };
         let rt_color = t.runtime_color(&runtime_name);
 
-        let mut menu = div()
-            .absolute()
-            .top(self.s(80.0))
-            .left(self.s(420.0))
-            .w(self.s(380.0))
-            .bg(t.palette_bg())
-            .border_1()
-            .border_color(t.palette_border())
-            .rounded(self.s(12.0))
-            .flex()
-            .flex_col()
-            .overflow_hidden()
-            .shadow(vec![BoxShadow {
-                color: t.shadow().into(),
-                offset: point(px(0.), self.s(8.0)),
-                blur_radius: self.s(24.0),
-                spread_radius: self.s(4.0),
-            }]);
+        let mut menu = self.modal(80.0, 420.0, 380.0, None);
 
         // Header
         menu = menu.child(
@@ -6192,17 +6402,7 @@ impl OpenSquirrel {
         for (i, item) in self.agent_menu_items.iter().enumerate() {
             let sel = i == self.agent_menu_selection;
             menu = menu.child(
-                div()
-                    .id(ElementId::Name(format!("amenu-{}", i).into()))
-                    .w_full()
-                    .px(self.s(14.0))
-                    .py(self.s(7.0))
-                    .cursor_pointer()
-                    .bg(if sel {
-                        t.selected_row()
-                    } else {
-                        rgba(0x00000000)
-                    })
+                self.selectable_row("amenu", i, sel)
                     .flex()
                     .flex_col()
                     .gap(self.s(2.0))
@@ -6238,12 +6438,7 @@ impl OpenSquirrel {
                 .child("arrows to navigate, enter to execute, esc to close"),
         );
 
-        let epoch = self.mode_epoch;
-        menu.with_animation(
-            ElementId::Name(format!("agentmenu-{}", epoch).into()),
-            Animation::new(Duration::from_millis(200)).with_easing(ease_out_quint()),
-            |el, delta| el.opacity(delta),
-        )
+        self.modal_fade(menu, "agentmenu")
     }
 
     fn render_setup(&self, cx: &mut Context<Self>) -> impl IntoElement + use<'_> {
@@ -6252,24 +6447,7 @@ impl OpenSquirrel {
         let show_machine_step =
             self.config.machines.len() > 1 && setup.selected_runtime != "terminal";
 
-        let mut w = div()
-            .absolute()
-            .top(self.s(80.0))
-            .left(self.s(350.0))
-            .w(self.s(600.0))
-            .bg(t.palette_bg())
-            .border_1()
-            .border_color(t.palette_border())
-            .rounded(self.s(12.0))
-            .flex()
-            .flex_col()
-            .overflow_hidden()
-            .shadow(vec![BoxShadow {
-                color: t.shadow().into(),
-                offset: point(px(0.), self.s(8.0)),
-                blur_radius: self.s(24.0),
-                spread_radius: self.s(4.0),
-            }]);
+        let mut w = self.modal(80.0, 350.0, 600.0, None);
 
         let steps: Vec<(&str, SetupStep)> = if show_machine_step {
             vec![
@@ -8179,10 +8357,10 @@ impl Render for OpenSquirrel {
                         .flex_shrink()
                         .min_w(px(0.))
                         .h_full()
-                        .p(px(3.0))
+                        .p(px(6.0))
                         .flex()
                         .flex_col()
-                        .gap(px(3.0))
+                        .gap(px(6.0))
                         .overflow_hidden();
 
                     let mut tile_idx = 0;
@@ -8202,7 +8380,7 @@ impl Render for OpenSquirrel {
                             .flex_shrink()
                             .flex_basis(px(0.))
                             .flex()
-                            .gap(px(3.0))
+                            .gap(px(6.0))
                             .overflow_hidden();
 
                         for _ in 0..tiles_in_row {
@@ -8222,7 +8400,7 @@ impl Render for OpenSquirrel {
                     .flex_shrink()
                     .min_w(px(0.))
                     .h_full()
-                    .p(px(4.0))
+                    .p(px(6.0))
                     .flex()
                     .flex_col()
                     .overflow_hidden();
@@ -8410,6 +8588,7 @@ impl Render for OpenSquirrel {
             Mode::Search => "SearchMode",
             Mode::AgentMenu => "AgentMenuMode",
             Mode::Settings => "SettingsMode",
+            Mode::ModelPicker => "ModelPickerMode",
         };
 
         // Wrap content in an overflow-hidden container so text can't push past window
@@ -8483,6 +8662,7 @@ impl Render for OpenSquirrel {
             .on_action(cx.listener(Self::close_tile))
             .on_action(cx.listener(Self::toggle_favorite))
             .on_action(cx.listener(Self::change_agent))
+            .on_action(cx.listener(Self::open_model_picker))
             .on_action(cx.listener(Self::restart_agent))
             .on_action(cx.listener(Self::toggle_auto_scroll))
             .on_action(cx.listener(Self::pipe_to_agent))
@@ -8540,6 +8720,9 @@ impl Render for OpenSquirrel {
         }
         if self.mode == Mode::AgentMenu {
             root = root.child(self.render_agent_menu(cx));
+        }
+        if self.mode == Mode::ModelPicker {
+            root = root.child(self.render_model_picker(cx));
         }
         if self.show_stats {
             root = root.child(self.render_stats());
@@ -8639,6 +8822,7 @@ pub(crate) fn run() {
             KeyBinding::new("cmd-n", SpawnAgent, None),
             KeyBinding::new("cmd-f", SearchOpen, None),
             KeyBinding::new("cmd-w", CloseTile, None),
+            KeyBinding::new("cmd-m", OpenModelPicker, Some("NormalMode")),
             KeyBinding::new("cmd-l", ToggleChanges, Some("NormalMode")),
             KeyBinding::new("cmd-=", ZoomIn, None),
             KeyBinding::new("cmd--", ZoomOut, None),
@@ -8653,6 +8837,12 @@ pub(crate) fn run() {
             KeyBinding::new("space", SetupToggle, Some("SetupMode")),
             KeyBinding::new("up", NavUp, Some("SetupMode")),
             KeyBinding::new("down", NavDown, Some("SetupMode")),
+            // Model picker overlay
+            KeyBinding::new("escape", ClosePalette, Some("ModelPickerMode")),
+            KeyBinding::new("up", NavUp, Some("ModelPickerMode")),
+            KeyBinding::new("down", NavDown, Some("ModelPickerMode")),
+            KeyBinding::new("enter", SubmitInput, Some("ModelPickerMode")),
+            KeyBinding::new("backspace", DeleteChar, Some("ModelPickerMode")),
             // Search overlay
             KeyBinding::new("escape", SearchClose, Some("SearchMode")),
             KeyBinding::new("up", NavUp, Some("SearchMode")),
@@ -8674,6 +8864,7 @@ pub(crate) fn run() {
             KeyBinding::new("ctrl-n", SpawnAgent, None),
             KeyBinding::new("ctrl-f", SearchOpen, None),
             KeyBinding::new("ctrl-w", CloseTile, None),
+            KeyBinding::new("ctrl-m", OpenModelPicker, Some("NormalMode")),
             KeyBinding::new("ctrl-l", ToggleChanges, Some("NormalMode")),
             KeyBinding::new("ctrl-=", ZoomIn, None),
             KeyBinding::new("ctrl--", ZoomOut, None),
